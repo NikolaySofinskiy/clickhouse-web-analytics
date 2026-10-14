@@ -1,4 +1,4 @@
-# ClickHouse Marketplace Web Analytics
+# ClickHouse Web Analytics
 
 Аналитический проект на ClickHouse: расчёт продуктовых метрик веб-трафика маркетплейса (DAU, воронка покупки, retention) на схемах с MergeTree и JOIN между логами и справочником товаров.
 
