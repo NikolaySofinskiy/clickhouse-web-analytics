@@ -2,12 +2,12 @@
 
 Аналитический проект на ClickHouse: расчёт метрик веб-трафика маркетплейса (DAU/WAU/MAU, воронка покупки, retention) на схемах с MergeTree и JOIN между логами и справочником товаров.
 
-> **О данных:** Набор синтетический, создан для демонстрации. Все `visitor_id`, `product_id`, URL и метки времени сгенерированы.
+> **О данных:** Набор синтетический, создан для демонстрации.
 
 ## 🛠️ Технологии
 
 - **ClickHouse** — MergeTree, LowCardinality, партиционирование, JOIN, оконные функции, `uniqState`/`uniqMerge`, `windowFunnel`, `argMin`
-- **SQL** — `countIf`, `uniq`, `uniqState`, `uniqMergeState`, `lagInFrame`, `first_value`, `argMin`, `dateDiff`, `windowFunnel`
+- **SQL** — `countIf`, `uniq`, `uniqState`, `uniqMerge`, `lagInFrame`, `first_value`, `argMin`, `dateDiff`, `windowFunnel`
 - **SQLize.online** — песочница для запуска
 
 ## 📊 Схема данных
@@ -23,7 +23,7 @@
 | event_type | LowCardinality(String) | Тип события |
 | url | String | URL страницы |
 | product_id | UInt32 | ID товара (заполнен для `product_view`, `add_to_cart`, `purchase`) |
-| duration_ms | UInt32 | Длительность в мс (0 для `add_to_cart`, `checkout`, `purchase` — у этих событий нет «длительности страницы») |
+| duration_ms | UInt32 | Длительность в мс (0 для `add_to_cart`, `checkout`, `purchase`) |
 | device_type | LowCardinality(String) | Тип устройства: `mobile`, `desktop`, `tablet` |
 | utm_source | LowCardinality(String) | Канал: `organic`, `ads`, `email`, `social` |
 
@@ -48,7 +48,7 @@
 
 ## 🚀 Запуск
 
-Все запросы выполняются за один прогон в [SQLize.online — ClickHouse](https://sqlize.online/), так как состояние между запусками не сохраняется. Порядок: сначала весь блок «Создание таблиц» + «Вставка данных», затем — аналитические запросы.
+Все запросы выполняются за один прогон в [SQLize.online — ClickHouse](https://sqlize.online/), так как состояние между запусками не сохраняется.
 
 ## 📈 Запросы и результаты
 
@@ -176,7 +176,7 @@ LEFT JOIN products p
 
 ### 4. DAU / WAU / MAU + Stickiness
 
-Считаем через `uniqState` + self-JOIN. `finalizeAggregation` вынесен в CTE, чтобы не группировать по состоянию.
+Считаем через `uniqState` + `uniqMerge` как оконную функцию с `ROWS BETWEEN`. Это **промышленный подход**, работающий в ClickHouse 25.x: неэкви-джойны (`BETWEEN` в `ON`) в новых версиях запрещены, а `uniqMerge` как оконная функция — поддерживается.
 
 ```sql
 WITH daily AS (
@@ -185,30 +185,36 @@ WITH daily AS (
         uniqState(visitor_id) AS visitors_state
     FROM events
     GROUP BY event_date
-),
-daily_final AS (
-    SELECT
-        event_date,
-        visitors_state,
-        finalizeAggregation(visitors_state) AS dau
-    FROM daily
 )
 SELECT
-    d.event_date,
-    d.dau,
-    finalizeAggregation(uniqMergeState(w.visitors_state)) AS wau,
-    finalizeAggregation(uniqMergeState(m.visitors_state)) AS mau,
+    event_date,
+    finalizeAggregation(visitors_state) AS dau,
+    finalizeAggregation(
+        uniqMerge(visitors_state) OVER (
+            ORDER BY event_date ASC
+            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+        )
+    ) AS wau,
+    finalizeAggregation(
+        uniqMerge(visitors_state) OVER (
+            ORDER BY event_date ASC
+            ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+        )
+    ) AS mau,
     round(
-        d.dau / nullIf(finalizeAggregation(uniqMergeState(m.visitors_state)), 0),
+        finalizeAggregation(visitors_state)
+        / nullIf(
+            finalizeAggregation(
+                uniqMerge(visitors_state) OVER (
+                    ORDER BY event_date ASC
+                    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                )
+            ), 0
+        ),
         3
     ) AS stickiness
-FROM daily_final d
-LEFT JOIN daily w
-    ON w.event_date BETWEEN d.event_date - 6 AND d.event_date
-LEFT JOIN daily m
-    ON m.event_date BETWEEN d.event_date - 29 AND d.event_date
-GROUP BY d.event_date, d.dau, d.visitors_state
-ORDER BY d.event_date;
+FROM daily
+ORDER BY event_date;
 ```
 
 | event_date | dau | wau | mau | stickiness |
@@ -218,145 +224,11 @@ ORDER BY d.event_date;
 | 2026-09-06 | 5 | 8 | 8 | 0.625 |
 | 2026-09-07 | 5 | 8 | 9 | 0.556 |
 
-> **Как это работает:** `uniqState` создаёт HyperLogLog-состояние по каждому дню, `uniqMergeState` мёржит состояния за 7/30 дней через self-JOIN, `finalizeAggregation` разворачивает в число.
+> **Как это работает:** `uniqState(visitor_id)` создаёт HyperLogLog-состояние по каждому дню. `uniqMerge(...) OVER (ROWS BETWEEN N PRECEDING AND CURRENT ROW)` мёржит состояния за N дней. Поскольку в `daily` одна строка на дату, `ROWS BETWEEN 6 PRECEDING` = 7 дней (WAU). `finalizeAggregation` разворачивает состояние в число.
 >
 > **Бизнес-смысл:** DAU стабилен (5), MAU растёт (5 → 9). Stickiness падает — новые юзеры не возвращаются ежедневно.
 
-### 5. DAU по устройствам
-
-```sql
-SELECT
-    device_type,
-    uniq(visitor_id)                   AS unique_users,
-    count(*)                           AS events,
-    toUInt32(round(avg(duration_ms)))  AS avg_duration_ms
-FROM events
-GROUP BY device_type
-ORDER BY unique_users DESC;
-```
-
-| device_type | unique_users | events | avg_duration_ms |
-|---|---|---|---|
-| mobile | 6 | 23 | 1789 |
-| desktop | 4 | 14 | 3271 |
-| tablet | 1 | 4 | 1813 |
-
-> **Инсайт:** mobile — основной канал по числу юзеров, но desktop даёт в 1.8 раза больше времени на событие. Desktop-аудитория более вовлечена.
-
-### 6. DAU по каналам
-
-```sql
-SELECT
-    utm_source,
-    uniq(visitor_id)                   AS unique_users,
-    count(*)                           AS events,
-    toUInt32(round(avg(duration_ms)))  AS avg_duration_ms
-FROM events
-GROUP BY utm_source
-ORDER BY unique_users DESC;
-```
-
-| utm_source | unique_users | events | avg_duration_ms |
-|---|---|---|---|
-| organic | 4 | 15 | 2907 |
-| ads | 1 | 13 | 1833 |
-| email | 2 | 10 | 2850 |
-| social | 2 | 7 | 3400 |
-
-> **Инсайт:** organic даёт больше всего уникальных юзеров (4), ads — самый активный по событиям (13 от одного юзера). social показывает самую высокую вовлечённость (3400 мс в среднем).
-
-### 7. Топ страниц по просмотрам
-
-```sql
-SELECT
-    url,
-    count(*)                           AS views,
-    uniq(visitor_id)                   AS unique_visitors,
-    toUInt32(round(avg(duration_ms)))  AS avg_duration_ms
-FROM events
-WHERE event_type = 'pageview'
-GROUP BY url
-ORDER BY views DESC;
-```
-
-| url | views | unique_visitors | avg_duration_ms |
-|---|---|---|---|
-| /home | 14 | 9 | 1393 |
-| /category/books | 4 | 3 | 4450 |
-| /docs | 3 | 2 | 5167 |
-
-> `/home` — транзитная точка входа, `/docs` и категории — глубокое вовлечение.
-
-### 8. Средняя длительность по типам событий
-
-```sql
-SELECT
-    event_type,
-    count(*)                           AS events,
-    toUInt32(round(avg(duration_ms)))  AS avg_duration_ms
-FROM events
-WHERE event_type IN ('pageview', 'product_view')
-GROUP BY event_type
-ORDER BY avg_duration_ms DESC;
-```
-
-| event_type | events | avg_duration_ms |
-|---|---|---|
-| product_view | 10 | 3250 |
-| pageview | 21 | 2781 |
-
-> На карточке товара юзеры проводят в среднем на 17% больше времени, чем на страницах. Карточка вовлекает, но не конвертит — точка роста.
-
-### 9. Сессии через `sessionize` (вычисляемый `session_id`)
-
-Показываем, как в реальном проекте вычисляется `session_id` через `lagInFrame` + running sum. Новая сессия — если разрыв > 30 минут.
-
-```sql
-WITH with_lag AS (
-    SELECT
-        visitor_id,
-        event_time,
-        lagInFrame(event_time) OVER (
-            PARTITION BY visitor_id ORDER BY event_time
-        ) AS prev_time
-    FROM events
-),
-with_flag AS (
-    SELECT
-        visitor_id,
-        event_time,
-        if(
-            prev_time IS NULL OR dateDiff('minute', prev_time, event_time) > 30,
-            1, 0
-        ) AS is_new_session
-    FROM with_lag
-)
-SELECT
-    visitor_id,
-    event_time,
-    sum(is_new_session) OVER (
-        PARTITION BY visitor_id ORDER BY event_time
-    ) AS computed_session_id
-FROM with_flag
-ORDER BY visitor_id, event_time
-LIMIT 15;
-```
-
-| visitor_id | event_time | computed_session_id |
-|---|---|---|
-| 101 | 2026-09-04 10:00:00 | 1 |
-| 101 | 2026-09-04 10:01:00 | 1 |
-| 101 | 2026-09-04 10:02:00 | 1 |
-| 101 | 2026-09-04 10:03:00 | 1 |
-| 101 | 2026-09-04 10:04:00 | 1 |
-| 101 | 2026-09-05 11:00:00 | 2 |
-| 101 | 2026-09-05 11:01:00 | 2 |
-| 101 | 2026-09-06 12:00:00 | 3 |
-| ... | ... | ... |
-
-> **Зачем это нужно:** в проде `session_id` не хранится, а вычисляется. Этот запрос показывает механику: новый `session_id` = +1 к running sum, если разрыв > 30 минут.
-
-### 10. Воронка покупки по сессиям
+### 5. Воронка покупки по сессиям
 
 ```sql
 WITH session_funnel AS (
@@ -390,42 +262,9 @@ ORDER BY step_num;
 
 > Главный отвал — `pageview → product_view` (CR 50%). На синтетических данных отвал выше реального (обычно 70–85%), но механика видна. `checkout → purchase` = 100% — оплата работает идеально.
 
-### 11. Воронка покупки по пользователям
+### 6. Воронка через `windowFunnel` (7 дней)
 
-```sql
-WITH user_funnel AS (
-    SELECT visitor_id, max(funnel_step) AS max_step
-    FROM v_events_enriched
-    GROUP BY visitor_id
-)
-SELECT
-    step_num,
-    step_name,
-    users,
-    round(users / first_value(users) OVER (ORDER BY step_num), 3) AS cr_from_start
-FROM (
-    SELECT 1 AS step_num, '1. pageview'     AS step_name, countIf(max_step >= 1) AS users FROM user_funnel
-    UNION ALL SELECT 2, '2. product_view', countIf(max_step >= 2) FROM user_funnel
-    UNION ALL SELECT 3, '3. add_to_cart',  countIf(max_step >= 3) FROM user_funnel
-    UNION ALL SELECT 4, '4. checkout',     countIf(max_step >= 4) FROM user_funnel
-    UNION ALL SELECT 5, '5. purchase',     countIf(max_step >= 5) FROM user_funnel
-)
-ORDER BY step_num;
-```
-
-| step_num | step_name | users | cr_from_start |
-|---|---|---|---|
-| 1 | 1. pageview | 9 | 1.000 |
-| 2 | 2. product_view | 8 | 0.889 |
-| 3 | 3. add_to_cart | 5 | 0.556 |
-| 4 | 4. checkout | 3 | 0.333 |
-| 5 | 5. purchase | 3 | 0.333 |
-
-> End-to-end конверсия в покупку — 33% от всех пришедших.
-
-### 12. Воронка через `windowFunnel` (7 дней)
-
-`windowFunnel` — встроенная функция ClickHouse, которая считает воронку за окно времени. Возвращает максимальный достигнутый шаг для каждого пользователя за окно. Здесь окно — **7 дней** (`7 * 86400` секунд), что реалистичнее для маркетплейса, чем 24 часа. Дополнительно фильтруем по дате — как в проде.
+`windowFunnel` — встроенная функция ClickHouse для подсчёта воронки за окно времени. Окно — **7 дней** (`7 * 86400` секунд), что реалистичнее для маркетплейса, чем 24 часа.
 
 ```sql
 SELECT
@@ -465,9 +304,9 @@ ORDER BY funnel_level;
 | 3 | 2 | до add_to_cart |
 | 5 | 3 | purchase |
 
-> **Как читать:** `funnel_level` — максимальный шаг, до которого дошёл юзер за 7 дней. `funnel_level = 5` — прошёл всю воронку. Окно 7 дней показывает, что часть юзеров покупает не в тот же день, а в течение недели.
+> **Как читать:** `funnel_level` — максимальный шаг, до которого дошёл юзер за 7 дней. `funnel_level = 5` — прошёл всю воронку.
 
-### 13. Retention по когортам (D1 / D3 / D7)
+### 7. Retention по когортам (D1 / D3 / D7)
 
 ```sql
 WITH first_visit AS (
@@ -506,134 +345,9 @@ ORDER BY cohort_date;
 | 2026-09-06 | 1 | 1 | 0 | 0 | 1.000 | 0.000 | 0.000 |
 | 2026-09-07 | 1 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 |
 
-> D1/D3/D7 — «активен **ровно** в N-й день после первого визита» (строгий retention). Если считать кумулятивно (`day_n >= N`), значения будут выше. `retention_d7 = 0` для всех когорт — **артефакт датасета**: данных всего 4 дня, юзеры физически не могли вернуться на 7-й день.
+> D1/D3/D7 — «активен **ровно** в N-й день после первого визита» (строгий retention). `retention_d7 = 0` для всех когорт — артефакт датасета: данных всего 4 дня, юзеры физически не могли вернуться на 7-й день.
 
-### 14. Retention по устройствам (D1)
-
-Здесь используется `argMin(device_type, event_time)` — берём `device_type` **первого события** юзера. Это корректнее, чем `any()`, который вернул бы случайное значение.
-
-```sql
-WITH first_visit AS (
-    SELECT
-        visitor_id,
-        min(event_date) AS cohort_date,
-        argMin(device_type, event_time) AS first_device
-    FROM events
-    GROUP BY visitor_id
-),
-activity AS (
-    SELECT DISTINCT
-        e.visitor_id,
-        f.cohort_date,
-        f.first_device,
-        dateDiff('day', f.cohort_date, e.event_date) AS day_n
-    FROM events e
-    JOIN first_visit f USING (visitor_id)
-)
-SELECT
-    first_device AS device_type,
-    countIf(day_n = 0) AS cohort_size,
-    countIf(day_n = 1) AS returned_d1,
-    round(countIf(day_n = 1) / nullIf(countIf(day_n = 0), 0), 3) AS retention_d1
-FROM activity
-GROUP BY first_device
-ORDER BY cohort_size DESC;
-```
-
-| device_type | cohort_size | returned_d1 | retention_d1 |
-|---|---|---|---|
-| mobile | 6 | 4 | 0.667 |
-| desktop | 2 | 1 | 0.500 |
-| tablet | 1 | 0 | 0.000 |
-
-> **Инсайт:** mobile-когорта удерживается лучше (67% на D1), чем desktop (50%). Для маркетплейса это сигнал: **мобильный опыт возвращает юзеров лучше**.
-
-### 15. Топ категорий по просмотрам товаров (JOIN)
-
-```sql
-SELECT
-    p.category,
-    count(*)            AS product_views,
-    uniq(e.visitor_id)  AS unique_visitors
-FROM events e
-INNER JOIN products p
-    ON e.product_id = p.product_id
-WHERE e.event_type = 'product_view'
-GROUP BY p.category
-ORDER BY product_views DESC;
-```
-
-| category | product_views | unique_visitors |
-|---|---|---|
-| Электроника | 4 | 2 |
-| Книги | 2 | 2 |
-| Спорт | 2 | 2 |
-| Дом | 1 | 1 |
-| Детские товары | 1 | 1 |
-
-> Топ категорий — основа категорийного менеджмента.
-
-### 16. Воронка по категориям (JOIN + условные агрегации)
-
-```sql
-SELECT
-    p.category,
-    countIf(e.event_type = 'product_view') AS views,
-    countIf(e.event_type = 'add_to_cart')  AS carts,
-    countIf(e.event_type = 'purchase')     AS purchases,
-    round(carts / nullIf(views, 0), 3)     AS cr_view_to_cart,
-    round(purchases / nullIf(carts, 0), 3) AS cr_cart_to_purchase
-FROM events e
-INNER JOIN products p
-    ON e.product_id = p.product_id
-GROUP BY p.category
-ORDER BY views DESC;
-```
-
-| category | views | carts | purchases | cr_view_to_cart | cr_cart_to_purchase |
-|---|---|---|---|---|---|
-| Электроника | 4 | 3 | 2 | 0.750 | 0.667 |
-| Книги | 2 | 0 | 0 | 0.000 | — |
-| Спорт | 2 | 2 | 1 | 1.000 | 0.500 |
-| Дом | 1 | 1 | 1 | 1.000 | 1.000 |
-| Детские товары | 1 | 0 | 0 | 0.000 | — |
-
-> **Инсайты:**
-> - **Дом** — 100% конверсия из корзины в покупку.
-> - **Электроника** — 75% в корзину, 67% из корзины в покупку.
-> - **Спорт** — 100% в корзину, 50% в покупку (юзер 109 добавил беговую дорожку, но не купил).
-> - **Книги и Детские товары** — смотрят, но не добавляют. Проблема на уровне карточки товара.
-
-### 17. Воронка по устройствам
-
-```sql
-WITH device_funnel AS (
-    SELECT
-        device_type,
-        session_id,
-        max(funnel_step) AS max_step
-    FROM v_events_enriched
-    GROUP BY device_type, session_id
-)
-SELECT
-    device_type,
-    countIf(max_step >= 1) AS sessions,
-    countIf(max_step >= 5) AS purchases,
-    round(countIf(max_step >= 5) / nullIf(countIf(max_step >= 1), 0), 3) AS cr_to_purchase
-FROM device_funnel
-GROUP BY device_type
-ORDER BY sessions DESC;
-```
-
-| device_type | sessions | purchases | cr_to_purchase |
-|---|---|---|---|
-| mobile | 13 | 3 | 0.231 |
-| desktop | 6 | 1 | 0.167 |
-| tablet | 2 | 0 | 0.000 |
-
-> **Инсайт:** mobile конвертит лучше desktop (23% vs 17%). Для маркетплейса: **мобильная версия работает хорошо, именно она — основной трафик**. Точка роста — tablet.
-
-### 18. Воронка по каналам
+### 8. Воронка по каналам (`utm_source`)
 
 ```sql
 WITH channel_funnel AS (
@@ -663,41 +377,51 @@ ORDER BY sessions DESC;
 
 > **Инсайт:** ads даёт лучшую конверсию (40%), несмотря на меньшее число сессий. organic — много трафика, но низкая конверсия (12.5%). social — 0% на 3 сессиях. Для маркетплейса это сигнал: **пересмотреть бюджеты в пользу ads, разобраться с social**.
 
-## 📋 Что дальше
+### 9. Воронка по категориям (JOIN + условные агрегации)
 
-Проект можно развивать в нескольких направлениях:
+```sql
+SELECT
+    p.category,
+    countIf(e.event_type = 'product_view') AS views,
+    countIf(e.event_type = 'add_to_cart')  AS carts,
+    countIf(e.event_type = 'purchase')     AS purchases,
+    round(carts / nullIf(views, 0), 3)     AS cr_view_to_cart,
+    round(purchases / nullIf(carts, 0), 3) AS cr_cart_to_purchase
+FROM events e
+INNER JOIN products p
+    ON e.product_id = p.product_id
+GROUP BY p.category
+ORDER BY views DESC;
+```
 
-- **Материализованное представление для DAU.** В проде вместо self-JOIN используют `AggregatingMergeTree` + `uniqState`:
-  ```sql
-  CREATE MATERIALIZED VIEW mv_daily_uniq
-  ENGINE = AggregatingMergeTree()
-  ORDER BY event_date
-  AS SELECT event_date, uniqState(visitor_id) AS visitors_state
-  FROM events
-  GROUP BY event_date;
-  ```
-  Тогда DAU за любой день — это `uniqMerge(visitors_state)`, а WAU/MAU — сумма по диапазону.
+| category | views | carts | purchases | cr_view_to_cart | cr_cart_to_purchase |
+|---|---|---|---|---|---|
+| Электроника | 4 | 3 | 2 | 0.750 | 0.667 |
+| Книги | 2 | 0 | 0 | 0.000 | — |
+| Спорт | 2 | 2 | 1 | 1.000 | 0.500 |
+| Дом | 1 | 1 | 1 | 1.000 | 1.000 |
+| Детские товары | 1 | 0 | 0 | 0.000 | — |
 
-- **`order_id` для покупок.** В реальном логе маркетплейса `purchase` — это заказ, а не товар. Один заказ может содержать несколько товаров. Это позволит считать средний чек и GMV.
+> **Инсайты:** Дом — 100% конверсия из корзины в покупку. Электроника — 75% в корзину, 67% из корзины в покупку. Книги и Детские товары — смотрят, но не добавляют: проблема на уровне карточки товара.
 
-- **`Dictionary` для справочника.** В проде `JOIN` со справочником заменяют на `Dictionary`-lookup — это быстрее.
+## 📋 Ключевые инсайты
 
-- **Больше данных.** 10–50k событий, 1–3 месяца, 500+ юзеров — тогда retention D7/D30 и когорты станут осмысленными.
-
-- **`ASOF JOIN`** для обогащения по времени (например, цена на момент покупки, а не текущая).
-
-- **Больше разрезов.** `utm_campaign`, `geo`, `browser` — стандартные измерения веб-аналитики.
+1. **Stickiness падает** с 1.0 до 0.56 за 4 дня — новые юзеры не возвращаются ежедневно.
+2. **Главный отвал воронки** — `pageview → product_view` (CR 50%). Точка роста — главная страница.
+3. **`checkout → purchase` = 100%** — оплата работает идеально, трогать не нужно.
+4. **ads конвертит 40%**, organic — только 12.5%. Бюджеты стоит пересмотреть.
+5. **mobile конвертит лучше desktop** (23% vs 17%).
+6. **Категории «Книги» и «Детские товары» — 0% в корзину.** Проблема на уровне карточки.
 
 ## ⚠️ Ограничения проекта
 
 - **Данные синтетические:** 9 юзеров, 45 событий, 4 дня. Достаточно для демонстрации механики, но не для зрелых инсайтов.
-- **`session_id`, `device_type`, `utm_source` заданы вручную.** В реальном проекте `session_id` вычисляется через `sessionize` (запрос №9), `device_type` — из user-agent, `utm_source` — из URL или cookie.
-- **Retention D1/D3/D7, а не D1/D7/D30.** На 4 днях данных D30 не посчитать. Механика та же — достаточно расширить окно.
-- **Retention считается строго** («ровно в N-й день»), а не кумулятивно («в N-й день или позже»). Оба подхода допустимы — выбор зависит от задачи.
-- **`retention_d7 = 0`** для всех когорт — артефакт датасета, а не проблема удержания.
-- **`windowFunnel` использует окно 7 дней.** Для маркетплейса это реалистичнее, чем 24 часа: юзер может добавить в корзину сегодня, а купить через неделю.
-- **`duration_ms = 0`** для `add_to_cart`, `checkout`, `purchase` — у этих событий нет «длительности страницы» в том же смысле, что у `pageview`.
-- **Нет `order_id`.** В реальном логе маркетплейса `purchase` — это заказ, а не товар. Здесь упрощено: одна покупка = один товар.
+- **`session_id`, `device_type`, `utm_source` заданы вручную.** В реальном проекте `session_id` вычисляется через `sessionize` (разрыв > 30 минут), `device_type` — из user-agent, `utm_source` — из URL или cookie.
+- **Retention D1/D3/D7, а не D1/D7/D30.** На 4 днях данных D30 не посчитать.
+- **Retention считается строго** («ровно в N-й день»), а не кумулятивно.
+- **`retention_d7 = 0`** — артефакт датасета, а не проблема удержания.
+- **`duration_ms = 0`** для `add_to_cart`, `checkout`, `purchase` — у этих событий нет «длительности страницы».
+- **Нет `order_id`.** В реальном логе `purchase` — это заказ, а не товар.
 
 ## 📁 Структура проекта
 
@@ -711,14 +435,9 @@ clickhouse-web-analytics/
 
 - OLAP-проектирование: MergeTree, партиционирование, LowCardinality, материализованные колонки.
 - Слой staging: обогащение фактов справочником, разметка шагов воронки.
-- DAU/WAU/MAU через `uniqState` + `uniqMergeState` — промышленный подход, работающий в любой версии ClickHouse.
-- **`sessionize`** — вычисление `session_id` через `lagInFrame` + running sum.
-- Корректная воронка (пошаговая, с CR) на уровне сессий и юзеров.
+- DAU/WAU/MAU через `uniqState` + `uniqMerge` с оконной рамкой `ROWS BETWEEN` — промышленный подход для ClickHouse 25.x.
 - Воронка через `windowFunnel` с окном 7 дней — ClickHouse-специфичная функция.
-- Воронка по категориям (JOIN + условные агрегации) — от `product_view` до `purchase`.
-- Воронка и retention по устройствам — продуктовые разрезы.
-- Воронка по каналам (`utm_source`) — маркетинговая аналитика.
+- Воронка по каналам (`utm_source`) и категориям — продуктовые разрезы.
 - Когортный retention (D1/D3/D7).
 - `argMin` для корректного определения первого устройства.
 - Window functions: `first_value`, `lagInFrame`, `dateDiff`.
-- ClickHouse-функции: `uniq`, `uniqState`, `uniqMergeState`, `finalizeAggregation`, `countIf`, `toYYYYMM`, `multiIf`, `windowFunnel`, `argMin`.
