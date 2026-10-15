@@ -2,7 +2,7 @@
 
 Аналитический проект на ClickHouse: расчёт метрик веб-трафика маркетплейса (DAU/WAU/MAU, воронка покупки, retention) на схемах с MergeTree и JOIN между логами и справочником товаров.
 
-> **О данных:** Набор синтетический, создан для демонстрации.
+> **О данных:** Набор синтетический, создан для демонстрации. Все `visitor_id`, `product_id`, URL и метки времени сгенерированы. `session_id`, `device_type` и `utm_source` заданы вручную (в реальном проекте `session_id` вычисляется через `sessionize` — разрыв > 30 минут, `device_type` — из user-agent, `utm_source` — из URL или cookie). Данных мало (9 юзеров, 4 дня), поэтому retention D30 не посчитать. `retention_d7 = 0` — артефакт датасета: у последних когорт просто не было времени вернуться.
 
 ## 🛠️ Технологии
 
@@ -176,7 +176,7 @@ LEFT JOIN products p
 
 ### 4. DAU / WAU / MAU + Stickiness
 
-Считаем через `uniqState` + `uniqMerge` как оконную функцию с `ROWS BETWEEN`. Это **промышленный подход**, работающий в ClickHouse 25.x: неэкви-джойны (`BETWEEN` в `ON`) в новых версиях запрещены, а `uniqMerge` как оконная функция — поддерживается.
+Считаем через `uniqState` + `uniqMerge` как оконную функцию с `ROWS BETWEEN`. **Важно:** `uniqMerge(...) OVER (...)` возвращает уже финализированное `UInt64`, поэтому `finalizeAggregation` вокруг него не нужен. `finalizeAggregation` применяется только к одиночному состоянию `visitors_state`.
 
 ```sql
 WITH daily AS (
@@ -189,26 +189,20 @@ WITH daily AS (
 SELECT
     event_date,
     finalizeAggregation(visitors_state) AS dau,
-    finalizeAggregation(
-        uniqMerge(visitors_state) OVER (
-            ORDER BY event_date ASC
-            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
-        )
+    uniqMerge(visitors_state) OVER (
+        ORDER BY event_date ASC
+        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
     ) AS wau,
-    finalizeAggregation(
-        uniqMerge(visitors_state) OVER (
-            ORDER BY event_date ASC
-            ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
-        )
+    uniqMerge(visitors_state) OVER (
+        ORDER BY event_date ASC
+        ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
     ) AS mau,
     round(
         finalizeAggregation(visitors_state)
         / nullIf(
-            finalizeAggregation(
-                uniqMerge(visitors_state) OVER (
-                    ORDER BY event_date ASC
-                    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
-                )
+            uniqMerge(visitors_state) OVER (
+                ORDER BY event_date ASC
+                ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
             ), 0
         ),
         3
@@ -224,7 +218,11 @@ ORDER BY event_date;
 | 2026-09-06 | 5 | 8 | 8 | 0.625 |
 | 2026-09-07 | 5 | 8 | 9 | 0.556 |
 
-> **Как это работает:** `uniqState(visitor_id)` создаёт HyperLogLog-состояние по каждому дню. `uniqMerge(...) OVER (ROWS BETWEEN N PRECEDING AND CURRENT ROW)` мёржит состояния за N дней. Поскольку в `daily` одна строка на дату, `ROWS BETWEEN 6 PRECEDING` = 7 дней (WAU). `finalizeAggregation` разворачивает состояние в число.
+> **Как это работает:**
+> 1. `uniqState(visitor_id)` создаёт HyperLogLog-состояние по каждому дню.
+> 2. `uniqMerge(visitors_state) OVER (ROWS BETWEEN N PRECEDING AND CURRENT ROW)` мёржит состояния за N предыдущих дней. В `daily` одна строка на дату → `ROWS BETWEEN 6 PRECEDING` = 7 дней (WAU).
+> 3. `finalizeAggregation(visitors_state)` разворачивает **одиночное** состояние DAU в число.
+> 4. `uniqMerge(...) OVER (...)` в ClickHouse уже возвращает `UInt64`, не состояние — поэтому `finalizeAggregation` не нужен.
 >
 > **Бизнес-смысл:** DAU стабилен (5), MAU растёт (5 → 9). Stickiness падает — новые юзеры не возвращаются ежедневно.
 
@@ -439,5 +437,4 @@ clickhouse-web-analytics/
 - Воронка через `windowFunnel` с окном 7 дней — ClickHouse-специфичная функция.
 - Воронка по каналам (`utm_source`) и категориям — продуктовые разрезы.
 - Когортный retention (D1/D3/D7).
-- `argMin` для корректного определения первого устройства.
 - Window functions: `first_value`, `lagInFrame`, `dateDiff`.
