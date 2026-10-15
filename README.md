@@ -210,6 +210,7 @@ SELECT
 FROM daily
 ORDER BY event_date;
 ```
+**Результат:**
 
 | event_date | dau | wau | mau | stickiness |
 |------------|-----|-----|-----|------------|
@@ -249,6 +250,8 @@ FROM (
 )
 ORDER BY step_num;
 ```
+
+**Результат:**
 
 | step_num | step_name       | sessions | cr_from_start | cr_from_prev |
 |----------|-----------------|----------|---------------|--------------|
@@ -339,6 +342,8 @@ GROUP BY cohort_date
 ORDER BY cohort_date;
 ```
 
+**Результат:**
+
 | cohort_date | d0 | d1 | d3 | d7 | retention_d1 | retention_d3 | retention_d7 |
 |-------------|----|----|----|----|--------------|--------------|--------------|
 | 2026-09-04  | 5  | 3  | 3  | 0  | 0.6          | 0.6          | 0            |
@@ -369,6 +374,8 @@ GROUP BY utm_source
 ORDER BY sessions DESC;
 ```
 
+**Результат:**
+
 | utm_source | sessions | purchases | cr_to_purchase |
 |------------|----------|-----------|----------------|
 | organic    | 8        | 1         | 0.125          |
@@ -396,6 +403,8 @@ INNER JOIN products p
 GROUP BY p.category
 ORDER BY views DESC;
 ```
+
+**Результат:**
 
 | category       | views | carts | purchases | cr_view_to_cart | cr_cart_to_purchase |
 |----------------|-------|-------|-----------|-----------------|---------------------|
