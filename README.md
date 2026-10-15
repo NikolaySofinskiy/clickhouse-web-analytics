@@ -438,3 +438,5 @@ clickhouse-web-analytics/
 - Воронка по каналам (`utm_source`) и категориям — продуктовые разрезы.
 - Когортный retention (D1/D3/D7).
 - Window functions: `first_value`, `lagInFrame`, `dateDiff`.
+
+https://sqlize.online/sql/clickhouse/baa600fe49b9dda847c6fb20377b3a9f/
