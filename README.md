@@ -2,12 +2,12 @@
 
 Аналитический проект на ClickHouse: расчёт метрик веб-трафика маркетплейса (DAU/WAU/MAU, воронка покупки, retention) на схемах с MergeTree и JOIN между логами и справочником товаров.
 
-> **О данных:** Набор синтетический, создан для демонстрации. Все `visitor_id`, `product_id`, URL и метки времени сгенерированы.
+> **О данных:** Набор синтетический, создан для демонстрации. Все `visitor_id`, `product_id`, URL и метки времени сгенерированы. `session_id` задан вручную (в реальном проекте вычисляется через `sessionize` — разрыв > 30 минут). Данных мало (9 юзеров, 4 дня), поэтому retention D7/D30 и зрелость последних когорт не посчитать.
 
 ## 🛠️ Технологии
 
 - **ClickHouse** — MergeTree, LowCardinality, партиционирование, JOIN, оконные функции
-- **SQL** — `countIf`, `uniq`, `lagInFrame`, `first_value`, `dateDiff`
+- **SQL** — `countIf`, `uniq`, `count(DISTINCT) OVER`, `lagInFrame`, `first_value`, `dateDiff`
 - **SQLize.online** — песочница для запуска
 
 ## 📊 Схема данных
@@ -170,27 +170,34 @@ LEFT JOIN products p
 
 ### 4. DAU / WAU / MAU + Stickiness
 
+Считаем через оконные функции с `RANGE BETWEEN` — один проход по данным, без неэкви-джойнов.
+
 ```sql
-WITH daily_visitors AS (
-    SELECT
-        event_date,
-        visitor_id
-    FROM events
-    GROUP BY event_date, visitor_id
-)
-SELECT
-    d.event_date,
-    uniq(d.visitor_id)  AS dau,
-    uniq(w.visitor_id)  AS wau,
-    uniq(m.visitor_id)  AS mau,
-    round(uniq(d.visitor_id) / nullIf(uniq(m.visitor_id), 0), 3) AS stickiness
-FROM daily_visitors d
-LEFT JOIN daily_visitors w
-    ON w.event_date BETWEEN d.event_date - 6 AND d.event_date
-LEFT JOIN daily_visitors m
-    ON m.event_date BETWEEN d.event_date - 29 AND d.event_date
-GROUP BY d.event_date
-ORDER BY d.event_date;
+SELECT DISTINCT
+    event_date,
+    count(DISTINCT visitor_id) OVER (
+        PARTITION BY event_date
+    ) AS dau,
+    count(DISTINCT visitor_id) OVER (
+        ORDER BY toUnixTimestamp(event_date)
+        RANGE BETWEEN 6 * 86400 PRECEDING AND CURRENT ROW
+    ) AS wau,
+    count(DISTINCT visitor_id) OVER (
+        ORDER BY toUnixTimestamp(event_date)
+        RANGE BETWEEN 29 * 86400 PRECEDING AND CURRENT ROW
+    ) AS mau,
+    round(
+        count(DISTINCT visitor_id) OVER (PARTITION BY event_date)
+        / nullIf(
+            count(DISTINCT visitor_id) OVER (
+                ORDER BY toUnixTimestamp(event_date)
+                RANGE BETWEEN 29 * 86400 PRECEDING AND CURRENT ROW
+            ), 0
+          ),
+        3
+    ) AS stickiness
+FROM events
+ORDER BY event_date;
 ```
 
 | event_date | dau | wau | mau | stickiness |
@@ -200,7 +207,7 @@ ORDER BY d.event_date;
 | 2026-09-06 | 5 | 8 | 8 | 0.625 |
 | 2026-09-07 | 5 | 8 | 9 | 0.556 |
 
-> DAU стабилен, MAU растёт. Stickiness падает — новые юзеры не возвращаются ежедневно.
+> DAU стабилен, MAU растёт. Stickiness падает — новые юзеры не возвращаются ежедневно. MAU = 9 — это все юзеры за всё время, так как данных всего 4 дня (окно 30 дней покрывает весь датасет).
 
 ### 5. Топ страниц по просмотрам
 
@@ -209,7 +216,7 @@ SELECT
     url,
     count()                 AS views,
     uniq(visitor_id)        AS unique_visitors,
-    round(avg(duration_ms)) AS avg_duration_ms
+    toUInt32(round(avg(duration_ms))) AS avg_duration_ms
 FROM events
 WHERE event_type = 'pageview'
 GROUP BY url
@@ -256,7 +263,7 @@ ORDER BY step_num;
 | 4 | 4. checkout | 4 | 0.200 | 0.667 |
 | 5 | 5. purchase | 4 | 0.200 | 1.000 |
 
-> Главный отвал — `pageview → product_view` (CR 50%) и `add_to_cart → checkout` (CR 33%). `checkout → purchase` = 100%.
+> Главный отвал — `pageview → product_view` (CR 50%). Для реального маркетплейса это много (обычно 70–85%), но данные синтетические. `checkout → purchase` = 100% — оплата работает идеально.
 
 ### 7. Воронка покупки по пользователям
 
@@ -326,7 +333,7 @@ ORDER BY cohort_date;
 | 2026-09-06 | 1 | 1 | 0 | 1.000 | 0.000 |
 | 2026-09-07 | 1 | 0 | 0 | 0.000 | 0.000 |
 
-> Когорта 04.09 удерживается на 60% в D1 и D3. Когорта 06.09 — 100% в D1.
+> **Как читать:** D1/D3 считаются как «активен ровно в 1-й / 3-й день после первого визита». Последняя когорта (07.09) незрелая: у неё не было времени вернуться в D1/D3, поэтому retention = 0.
 
 ### 9. Топ категорий по просмотрам товаров (JOIN)
 
@@ -353,6 +360,14 @@ ORDER BY product_views DESC;
 
 > Топ категорий — основа категорийного менеджмента.
 
+## ⚠️ Ограничения проекта
+
+- **Данные синтетические:** 9 юзеров, 45 событий, 4 дня. Этого достаточно для демонстрации механики, но недостаточно для зрелых инсайтов.
+- **`session_id` задан вручную.** В реальном проекте сессии вычисляются через `sessionize` (разрыв > 30 минут между событиями одного юзера).
+- **Retention D1/D3, а не D1/D7/D30.** На 4 днях данных D7/D30 не посчитать. Механика та же — достаточно расширить окно.
+- **Воронка по категориям обрывается на `add_to_cart`.** В `purchase`-событиях `product_id = 0`, поэтому JOIN со справочником не даёт категорию. В реальном логе маркетплейса в `purchase` всегда есть `product_id`.
+- **Нет разрезов по устройству, каналу, гео.** В реальном проекте воронка и retention считаются в разрезе этих измерений.
+
 ## 📁 Структура проекта
 
 ```
@@ -364,8 +379,9 @@ clickhouse-web-analytics/
 ## 📌 Что демонстрирует
 
 - OLAP-проектирование: MergeTree, партиционирование, LowCardinality, материализованные колонки.
+- Слой staging: обогащение фактов справочником, разметка шагов воронки.
+- DAU/WAU/MAU через оконные функции (`count(DISTINCT) OVER (RANGE BETWEEN ...)`) — промышленный подход.
 - Корректная воронка (пошаговая, с CR) на уровне сессий и юзеров.
 - Когортный retention (D1/D3).
-- DAU/WAU/MAU + stickiness.
 - Window functions: `first_value`, `lagInFrame`, `dateDiff`.
 - ClickHouse-функции: `uniq`, `countIf`, `toYYYYMM`, `multiIf`.
