@@ -1,89 +1,54 @@
 # ClickHouse Web Analytics
 
-Аналитический проект на ClickHouse: расчёт продуктовых метрик веб-трафика маркетплейса (DAU, воронка покупки, retention) на схемах с MergeTree и JOIN между логами и справочником товаров.
+Проект на ClickHouse: расчёт метрик веб-трафика маркетплейса (DAU/WAU/MAU, воронка покупки, retention) на схемах с MergeTree и JOIN между логами и справочником товаров.
 
-## 📖 О проекте
-
-Проект показывает полный цикл работы с ClickHouse: проектирование нескольких таблиц, загрузку данных и расчёт метрик с использованием `JOIN`. Цель — продемонстрировать навыки работы с колоночной СУБД и понимание того, чем аналитическая (OLAP) нагрузка отличается от транзакционной (OLTP).
-
-Проект отвечает на вопросы: как спроектировать несколько таблиц под аналитику веб-трафика маркетплейса, как эффективно хранить данные, как джойнить события со справочником и как считать продуктовые метрики на диалекте ClickHouse. В качестве примера используется веб-аналитика маркетплейса: логи поведения пользователей на сайте — просмотры страниц, просмотры карточек товаров, добавления в корзину, начало оформления и покупки. Справочник товаров позволяет обогатить события названием, категорией и ценой, а затем посчитать метрики в разрезе категорий.
+> **О данных:** Набор синтетический, создан для демонстрации. Все `visitor_id`, `product_id`, URL и метки времени сгенерированы.
 
 ## 🛠️ Технологии
 
-- **ClickHouse** — движок MergeTree, LowCardinality, партиционирование, JOIN
-- **SQL** — агрегации, JOIN, работа с датами, функции ClickHouse (`countIf`, `uniq`)
-- **SQLize.online** — онлайн-песочница для запуска
+- **ClickHouse** — MergeTree, LowCardinality, партиционирование, JOIN, оконные функции
+- **SQL** — `countIf`, `uniq`, `lagInFrame`, `first_value`, `dateDiff`
+- **SQLize.online** — песочница для запуска
 
 ## 📊 Схема данных
 
-Две таблицы: `events` (факт-логи веб-трафика) и `products` (справочник товаров).
+### `events` — факт-логи веб-трафика
 
-### Таблица `events`
+| Колонка | Тип | Описание |
+|---|---|---|
+| event_time | DateTime | Время события |
+| event_date | Date MATERIALIZED | Дата события |
+| visitor_id | UInt64 | ID посетителя |
+| session_id | UInt64 | ID сессии |
+| event_type | LowCardinality(String) | Тип события |
+| url | String | URL страницы |
+| product_id | UInt32 | ID товара (0, если не связано) |
+| duration_ms | UInt32 | Длительность в мс |
 
-| Колонка       | Тип                    | Описание                                             |
-|---------------|------------------------|------------------------------------------------------|
-| event_time    | DateTime               | Время события                                        |
-| visitor_id    | UInt64                 | ID посетителя                                        |
-| event_type    | LowCardinality(String) | Тип события (см. таблицу ниже)                       |
-| url           | String                 | URL страницы                                         |
-| product_id    | UInt32                 | ID товара (0, если событие не связано с товаром)     |
-| duration_ms   | UInt32                 | Длительность в миллисекундах                         |
+### `products` — справочник
 
-### Таблица `products`
+| Колонка | Тип | Описание |
+|---|---|---|
+| product_id | UInt32 | ID товара |
+| product_name | String | Название |
+| category | LowCardinality(String) | Категория |
+| price | UInt32 | Цена |
 
-| Колонка      | Тип                    | Описание             |
-|--------------|------------------------|----------------------|
-| product_id   | UInt32                 | ID товара            |
-| product_name | String                 | Название товара      |
-| category     | LowCardinality(String) | Категория товара     |
-| price        | UInt32                 | Цена в рублях        |
+### Типы событий (шаги воронки)
 
-### Типы событий `events.event_type`
+| event_type | Шаг |
+|---|---|
+| `pageview` | 1 |
+| `product_view` | 2 |
+| `add_to_cart` | 3 |
+| `checkout` | 4 |
+| `purchase` | 5 |
 
-| event_type     | Что означает                                       |
-|----------------|----------------------------------------------------|
-| `pageview`     | Просмотр страницы (главная, категория, docs)       |
-| `product_view` | Просмотр карточки товара                           |
-| `add_to_cart`  | Добавление товара в корзину                        |
-| `checkout`     | Начало оформления заказа                           |
-| `purchase`     | Успешная покупка                                   |
+## 🚀 Запуск
 
-> **О данных:** Набор данных синтетический и создан исключительно для демонстрации возможностей ClickHouse. Все `visitor_id`, `product_id`, URL и временные метки сгенерированы. Проект не использует реальные логи, персональные данные или коммерческую информацию.
+Всё выполняется за один прогон в [SQLize.online — ClickHouse](https://sqlize.online/).
 
-Особенности схемы: `PARTITION BY toYYYYMM(event_time)` разбивает данные по месяцам и ускоряет запросы с фильтром по дате; `ORDER BY (event_time, visitor_id)` задаёт сортировку внутри партиции, которая работает как индекс; `LowCardinality(String)` оптимизирует колонки с малым числом уникальных значений (`event_type`, `category`); `UInt32` и `UInt64` заменяют тяжёлые строковые и целочисленные типы, экономя память. Для JOIN между `events` и `products` используется `product_id` — в ClickHouse для справочников часто используют движок `Join` или `Dictionary`, но для учебного проекта достаточно MergeTree и обычного `JOIN`.
-
-### Пример данных
-
-Несколько строк из таблицы `events`:
-
-| event_time          | visitor_id | event_type   | url               | product_id | duration_ms |
-|---------------------|------------|--------------|-------------------|------------|-------------|
-| 2026-09-04 10:00:00 | 101        | pageview     | /home             | 0          | 1200        |
-| 2026-09-04 10:01:00 | 101        | product_view | /product/101      | 101        | 3400        |
-| 2026-09-04 10:02:00 | 101        | add_to_cart  | /cart             | 101        | 0           |
-| 2026-09-04 10:03:00 | 101        | checkout     | /checkout         | 0          | 0           |
-| 2026-09-04 10:04:00 | 101        | purchase     | /checkout/success | 0          | 0           |
-| 2026-09-04 10:05:00 | 102        | pageview     | /home             | 0          | 1500        |
-| 2026-09-04 10:06:00 | 102        | pageview     | /category/books   | 0          | 5000        |
-
-Несколько строк из таблицы `products`:
-
-| product_id | product_name    | category       | price  |
-|------------|-----------------|----------------|--------|
-| 101        | Смартфон X      | Электроника    | 45000  |
-| 102        | Наушники Y      | Электроника    | 8000   |
-| 103        | Книга "SQL"     | Книги          | 1200   |
-| 104        | Кофемашина Z    | Дом            | 35000  |
-| 105        | Беговая дорожка | Спорт          | 60000  |
-| 106        | Конструктор     | Детские товары | 2500   |
-
-## 🚀 Запуск проекта
-
-Все шаги выполняются в [SQLize.online — ClickHouse](https://sqlize.online/sql/clickhouse/).
-
-> ⚠️ **Важно:** SQLize.online не сохраняет состояние между отдельными запусками. Каждый `Run` создаёт новую временную базу данных. Поэтому весь код ниже нужно выполнить за один запуск, а не по частям.
-
-### Создание таблиц
+### 1. Создание таблиц
 
 ```sql
 CREATE TABLE products
@@ -99,18 +64,20 @@ ORDER BY product_id;
 CREATE TABLE events
 (
     event_time  DateTime,
+    event_date  Date MATERIALIZED toDate(event_time),
     visitor_id  UInt64,
+    session_id  UInt64,
     event_type  LowCardinality(String),
     url         String,
     product_id  UInt32,
     duration_ms UInt32
 )
 ENGINE = MergeTree()
-PARTITION BY toYYYYMM(event_time)
-ORDER BY (event_time, visitor_id);
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (event_date, visitor_id, event_time);
 ```
 
-### Вставка данных
+### 2. Вставка данных
 
 ```sql
 INSERT INTO products VALUES
@@ -121,345 +88,283 @@ INSERT INTO products VALUES
 (105, 'Беговая дорожка',  'Спорт',          60000),
 (106, 'Конструктор',      'Детские товары',  2500);
 
-INSERT INTO events VALUES
--- 2026-09-04 (день 1)
-('2026-09-04 10:00:00', 101, 'pageview',     '/home',              0, 1200),
-('2026-09-04 10:01:00', 101, 'product_view', '/product/101',     101, 3400),
-('2026-09-04 10:02:00', 101, 'add_to_cart',  '/cart',            101,    0),
-('2026-09-04 10:03:00', 101, 'checkout',     '/checkout',          0,    0),
-('2026-09-04 10:04:00', 101, 'purchase',     '/checkout/success',  0,    0),
-('2026-09-04 10:05:00', 102, 'pageview',     '/home',              0, 1500),
-('2026-09-04 10:06:00', 102, 'pageview',     '/category/books',    0, 5000),
-('2026-09-04 10:07:00', 103, 'pageview',     '/home',              0,  900),
-('2026-09-04 10:08:00', 103, 'product_view', '/product/103',     103, 2500),
-('2026-09-04 10:09:00', 107, 'pageview',     '/docs',              0, 4200),
-('2026-09-04 10:10:00', 108, 'pageview',     '/home',              0, 1300),
-
--- 2026-09-05 (день 2)
-('2026-09-05 11:00:00', 101, 'pageview',     '/home',              0, 1100),
-('2026-09-05 11:01:00', 101, 'product_view', '/product/101',     101, 2900),
-('2026-09-05 11:02:00', 104, 'pageview',     '/home',              0, 2000),
-('2026-09-05 11:03:00', 104, 'product_view', '/product/104',     104, 7000),
-('2026-09-05 11:04:00', 104, 'add_to_cart',  '/cart',            104,    0),
-('2026-09-05 11:05:00', 104, 'checkout',     '/checkout',          0,    0),
-('2026-09-05 11:06:00', 104, 'purchase',     '/checkout/success',  0,    0),
-('2026-09-05 11:07:00', 105, 'pageview',     '/home',              0,  800),
-('2026-09-05 11:08:00', 107, 'pageview',     '/category/books',    0, 3600),
-('2026-09-05 11:09:00', 108, 'pageview',     '/home',              0, 2500),
-('2026-09-05 11:10:00', 108, 'product_view', '/product/102',     102, 2200),
-('2026-09-05 11:11:00', 108, 'add_to_cart',  '/cart',            102,    0),
-
--- 2026-09-06 (день 3)
-('2026-09-06 12:00:00', 101, 'pageview',     '/home',              0, 1050),
-('2026-09-06 12:01:00', 102, 'pageview',     '/category/books',    0, 4800),
-('2026-09-06 12:02:00', 102, 'product_view', '/product/103',     103, 3100),
-('2026-09-06 12:03:00', 105, 'pageview',     '/docs',              0, 6100),
-('2026-09-06 12:04:00', 105, 'product_view', '/product/105',     105, 4300),
-('2026-09-06 12:05:00', 105, 'add_to_cart',  '/cart',            105,    0),
-('2026-09-06 12:06:00', 105, 'checkout',     '/checkout',          0,    0),
-('2026-09-06 12:07:00', 105, 'purchase',     '/checkout/success',  0,    0),
-('2026-09-06 12:08:00', 107, 'pageview',     '/home',              0, 1400),
-('2026-09-06 12:09:00', 109, 'pageview',     '/home',              0, 1700),
-('2026-09-06 12:10:00', 109, 'product_view', '/product/105',     105, 3300),
-('2026-09-06 12:11:00', 109, 'add_to_cart',  '/cart',            105,    0),
-
--- 2026-09-07 (день 4)
-('2026-09-07 13:00:00', 101, 'pageview',     '/home',              0, 1000),
-('2026-09-07 13:01:00', 101, 'product_view', '/product/101',     101, 3100),
-('2026-09-07 13:02:00', 101, 'add_to_cart',  '/cart',            101,    0),
-('2026-09-07 13:03:00', 101, 'checkout',     '/checkout',          0,    0),
-('2026-09-07 13:04:00', 101, 'purchase',     '/checkout/success',  0,    0),
-('2026-09-07 13:05:00', 106, 'pageview',     '/home',              0, 1800),
-('2026-09-07 13:06:00', 106, 'product_view', '/product/106',     106, 1200),
-('2026-09-07 13:07:00', 107, 'pageview',     '/docs',              0, 5200),
-('2026-09-07 13:08:00', 108, 'pageview',     '/home',              0, 1250),
-('2026-09-07 13:09:00', 109, 'pageview',     '/category/books',    0, 4400);
+INSERT INTO events
+(event_time, visitor_id, session_id, event_type, url, product_id, duration_ms)
+VALUES
+('2026-09-04 10:00:00', 101, 20260904000101, 'pageview',     '/home',              0, 1200),
+('2026-09-04 10:01:00', 101, 20260904000101, 'product_view', '/product/101',     101, 3400),
+('2026-09-04 10:02:00', 101, 20260904000101, 'add_to_cart',  '/cart',            101,    0),
+('2026-09-04 10:03:00', 101, 20260904000101, 'checkout',     '/checkout',          0,    0),
+('2026-09-04 10:04:00', 101, 20260904000101, 'purchase',     '/checkout/success',  0,    0),
+('2026-09-04 10:05:00', 102, 20260904000102, 'pageview',     '/home',              0, 1500),
+('2026-09-04 10:06:00', 102, 20260904000102, 'pageview',     '/category/books',    0, 5000),
+('2026-09-04 10:07:00', 103, 20260904000103, 'pageview',     '/home',              0,  900),
+('2026-09-04 10:08:00', 103, 20260904000103, 'product_view', '/product/103',     103, 2500),
+('2026-09-04 10:09:00', 107, 20260904000107, 'pageview',     '/docs',              0, 4200),
+('2026-09-04 10:10:00', 108, 20260904000108, 'pageview',     '/home',              0, 1300),
+('2026-09-05 11:00:00', 101, 20260905000101, 'pageview',     '/home',              0, 1100),
+('2026-09-05 11:01:00', 101, 20260905000101, 'product_view', '/product/101',     101, 2900),
+('2026-09-05 11:02:00', 104, 20260905000104, 'pageview',     '/home',              0, 2000),
+('2026-09-05 11:03:00', 104, 20260905000104, 'product_view', '/product/104',     104, 7000),
+('2026-09-05 11:04:00', 104, 20260905000104, 'add_to_cart',  '/cart',            104,    0),
+('2026-09-05 11:05:00', 104, 20260905000104, 'checkout',     '/checkout',          0,    0),
+('2026-09-05 11:06:00', 104, 20260905000104, 'purchase',     '/checkout/success',  0,    0),
+('2026-09-05 11:07:00', 105, 20260905000105, 'pageview',     '/home',              0,  800),
+('2026-09-05 11:08:00', 107, 20260905000107, 'pageview',     '/category/books',    0, 3600),
+('2026-09-05 11:09:00', 108, 20260905000108, 'pageview',     '/home',              0, 2500),
+('2026-09-05 11:10:00', 108, 20260905000108, 'product_view', '/product/102',     102, 2200),
+('2026-09-05 11:11:00', 108, 20260905000108, 'add_to_cart',  '/cart',            102,    0),
+('2026-09-06 12:00:00', 101, 20260906000101, 'pageview',     '/home',              0, 1050),
+('2026-09-06 12:01:00', 102, 20260906000102, 'pageview',     '/category/books',    0, 4800),
+('2026-09-06 12:02:00', 102, 20260906000102, 'product_view', '/product/103',     103, 3100),
+('2026-09-06 12:03:00', 105, 20260906000105, 'pageview',     '/docs',              0, 6100),
+('2026-09-06 12:04:00', 105, 20260906000105, 'product_view', '/product/105',     105, 4300),
+('2026-09-06 12:05:00', 105, 20260906000105, 'add_to_cart',  '/cart',            105,    0),
+('2026-09-06 12:06:00', 105, 20260906000105, 'checkout',     '/checkout',          0,    0),
+('2026-09-06 12:07:00', 105, 20260906000105, 'purchase',     '/checkout/success',  0,    0),
+('2026-09-06 12:08:00', 107, 20260906000107, 'pageview',     '/home',              0, 1400),
+('2026-09-06 12:09:00', 109, 20260906000109, 'pageview',     '/home',              0, 1700),
+('2026-09-06 12:10:00', 109, 20260906000109, 'product_view', '/product/105',     105, 3300),
+('2026-09-06 12:11:00', 109, 20260906000109, 'add_to_cart',  '/cart',            105,    0),
+('2026-09-07 13:00:00', 101, 20260907000101, 'pageview',     '/home',              0, 1000),
+('2026-09-07 13:01:00', 101, 20260907000101, 'product_view', '/product/101',     101, 3100),
+('2026-09-07 13:02:00', 101, 20260907000101, 'add_to_cart',  '/cart',            101,    0),
+('2026-09-07 13:03:00', 101, 20260907000101, 'checkout',     '/checkout',          0,    0),
+('2026-09-07 13:04:00', 101, 20260907000101, 'purchase',     '/checkout/success',  0,    0),
+('2026-09-07 13:05:00', 106, 20260907000106, 'pageview',     '/home',              0, 1800),
+('2026-09-07 13:06:00', 106, 20260907000106, 'product_view', '/product/106',     106, 1200),
+('2026-09-07 13:07:00', 107, 20260907000107, 'pageview',     '/docs',              0, 5200),
+('2026-09-07 13:08:00', 108, 20260907000108, 'pageview',     '/home',              0, 1250),
+('2026-09-07 13:09:00', 109, 20260907000109, 'pageview',     '/category/books',    0, 4400);
 ```
 
-## 📈 Аналитические запросы
-
-### 1. DAU за последний день
+### 3. Обогащённое представление
 
 ```sql
-SELECT uniq(visitor_id) AS dau
-FROM events
-WHERE toDate(event_time) = '2026-09-07';
+CREATE VIEW v_events_enriched AS
+SELECT
+    e.event_time,
+    e.event_date,
+    e.visitor_id,
+    e.session_id,
+    e.event_type,
+    e.url,
+    e.product_id,
+    e.duration_ms,
+    p.product_name,
+    p.category,
+    multiIf(
+        e.event_type = 'pageview',     1,
+        e.event_type = 'product_view', 2,
+        e.event_type = 'add_to_cart',  3,
+        e.event_type = 'checkout',     4,
+        e.event_type = 'purchase',     5,
+        0
+    ) AS funnel_step
+FROM events e
+LEFT JOIN products p
+    ON e.product_id = p.product_id AND e.product_id != 0;
 ```
 
-**Результат:**
-| dau |
-|-----|
-| 5   |
+## 📈 Метрики
 
-> **Бизнес-смысл:** DAU (Daily Active Users) — базовая метрика вовлечённости. На маркетплейсе считается за день и используется для оценки трафика и нагрузки.
+### 1. DAU / WAU / MAU + Stickiness
 
-### 2. Топ страниц по просмотрам
+```sql
+WITH daily AS (
+    SELECT event_date, uniq(visitor_id) AS dau
+    FROM events
+    GROUP BY event_date
+)
+SELECT
+    event_date,
+    dau,
+    (SELECT uniq(visitor_id) FROM events
+     WHERE event_date BETWEEN d.event_date - 6 AND d.event_date) AS wau,
+    (SELECT uniq(visitor_id) FROM events
+     WHERE event_date BETWEEN d.event_date - 29 AND d.event_date) AS mau,
+    round(dau / nullIf(mau, 0), 3) AS stickiness
+FROM daily d
+ORDER BY event_date;
+```
+
+| event_date | dau | wau | mau | stickiness |
+|---|---|---|---|---|
+| 2026-09-04 | 5 | 5 | 5 | 1.000 |
+| 2026-09-05 | 5 | 7 | 7 | 0.714 |
+| 2026-09-06 | 5 | 8 | 8 | 0.625 |
+| 2026-09-07 | 5 | 8 | 9 | 0.556 |
+
+> DAU стабилен, MAU растёт. Stickiness падает — новые юзеры не возвращаются ежедневно.
+
+### 2. Топ страниц
 
 ```sql
 SELECT
     url,
     count()                 AS views,
+    uniq(visitor_id)        AS unique_visitors,
     round(avg(duration_ms)) AS avg_duration_ms
 FROM events
 WHERE event_type = 'pageview'
 GROUP BY url
-ORDER BY views DESC
-LIMIT 5;
+ORDER BY views DESC;
 ```
 
-**Результат:**
-| url             | views | avg_duration_ms |
-|-----------------|-------|-----------------|
-| /home           | 14    | 1393            |
-| /category/books | 4     | 4450            |
-| /docs           | 3     | 5167            |
+| url | views | unique_visitors | avg_duration_ms |
+|---|---|---|---|
+| /home | 14 | 9 | 1393 |
+| /category/books | 4 | 4 | 4450 |
+| /docs | 3 | 2 | 5167 |
 
-> **Бизнес-смысл:** топ страниц показывает, куда идёт трафик. Главная — точка входа, категории и карточки — точки интереса. Высокая длительность = вовлечённость.
+> `/home` — транзитная точка входа, `/docs` и категории — глубокое вовлечение.
 
-### 3. Динамика по дням
+### 3. Воронка по сессиям
 
 ```sql
+WITH session_funnel AS (
+    SELECT session_id, visitor_id, max(funnel_step) AS max_step
+    FROM v_events_enriched
+    GROUP BY session_id, visitor_id
+)
 SELECT
-    toDate(event_time) AS day,
-    count()            AS total_events,
-    uniq(visitor_id)   AS unique_visitors
-FROM events
-GROUP BY day
-ORDER BY day;
+    step_num,
+    step_name,
+    sessions,
+    round(sessions / first_value(sessions) OVER (ORDER BY step_num), 3) AS cr_from_start,
+    round(sessions / lagInFrame(sessions) OVER (ORDER BY step_num), 3)  AS cr_from_prev
+FROM (
+    SELECT 1 AS step_num, '1. pageview'     AS step_name, countIf(max_step >= 1) AS sessions FROM session_funnel
+    UNION ALL SELECT 2, '2. product_view', countIf(max_step >= 2) FROM session_funnel
+    UNION ALL SELECT 3, '3. add_to_cart',  countIf(max_step >= 3) FROM session_funnel
+    UNION ALL SELECT 4, '4. checkout',     countIf(max_step >= 4) FROM session_funnel
+    UNION ALL SELECT 5, '5. purchase',     countIf(max_step >= 5) FROM session_funnel
+)
+ORDER BY step_num;
 ```
 
-**Результат:**
-| day        | total_events | unique_visitors |
-|------------|--------------|-----------------|
-| 2026-09-04 | 11           | 5               |
-| 2026-09-05 | 12           | 5               |
-| 2026-09-06 | 12           | 5               |
-| 2026-09-07 | 10           | 5               |
+| step_num | step_name | sessions | cr_from_start | cr_from_prev |
+|---|---|---|---|---|
+| 1 | 1. pageview | 14 | 1.000 | — |
+| 2 | 2. product_view | 10 | 0.714 | 0.714 |
+| 3 | 3. add_to_cart | 6 | 0.429 | 0.600 |
+| 4 | 4. checkout | 4 | 0.286 | 0.667 |
+| 5 | 5. purchase | 4 | 0.286 | 1.000 |
 
-> **Бизнес-смысл:** динамика трафика по дням — основа для отслеживания трендов и сезонности маркетплейса.
+> Главный отвал — `product_view → add_to_cart` (CR 60%). `checkout → purchase` = 100%.
 
-### 4. Воронка покупки
+### 4. Воронка по пользователям
 
 ```sql
+WITH user_funnel AS (
+    SELECT visitor_id, max(funnel_step) AS max_step
+    FROM v_events_enriched
+    GROUP BY visitor_id
+)
 SELECT
-    event_type,
-    count()          AS total,
-    uniq(visitor_id) AS unique_visitors
-FROM events
-WHERE event_type IN ('pageview', 'product_view', 'add_to_cart', 'checkout', 'purchase')
-GROUP BY event_type
-ORDER BY total DESC;
+    step_num,
+    step_name,
+    users,
+    round(users / first_value(users) OVER (ORDER BY step_num), 3) AS cr_from_start
+FROM (
+    SELECT 1 AS step_num, '1. pageview'     AS step_name, countIf(max_step >= 1) AS users FROM user_funnel
+    UNION ALL SELECT 2, '2. product_view', countIf(max_step >= 2) FROM user_funnel
+    UNION ALL SELECT 3, '3. add_to_cart',  countIf(max_step >= 3) FROM user_funnel
+    UNION ALL SELECT 4, '4. checkout',     countIf(max_step >= 4) FROM user_funnel
+    UNION ALL SELECT 5, '5. purchase',     countIf(max_step >= 5) FROM user_funnel
+)
+ORDER BY step_num;
 ```
 
-**Результат:**
-| event_type   | total | unique_visitors |
-|--------------|-------|-----------------|
-| pageview     | 21    | 9               |
-| product_view | 10    | 8               |
-| add_to_cart  | 6     | 5               |
-| purchase     | 4     | 3               |
-| checkout     | 4     | 3               |
+| step_num | step_name | users | cr_from_start |
+|---|---|---|---|
+| 1 | 1. pageview | 9 | 1.000 |
+| 2 | 2. product_view | 8 | 0.889 |
+| 3 | 3. add_to_cart | 5 | 0.556 |
+| 4 | 4. checkout | 3 | 0.333 |
+| 5 | 5. purchase | 3 | 0.333 |
 
-> **Бизнес-смысл:** воронка покупки — ключевая метрика маркетплейса. Показывает, на каком шаге теряются пользователи. Сравнивая `unique_visitors` по шагам, можно посчитать конверсию между этапами.
+> End-to-end конверсия в покупку — 33% от всех пришедших.
 
-### 5. Топ-5 посетителей по активности
+### 5. Retention по когортам (D1/D3)
 
 ```sql
+WITH first_visit AS (
+    SELECT visitor_id, min(event_date) AS cohort_date
+    FROM events
+    GROUP BY visitor_id
+),
+activity AS (
+    SELECT DISTINCT
+        e.visitor_id,
+        f.cohort_date,
+        dateDiff('day', f.cohort_date, e.event_date) AS day_n
+    FROM events e
+    JOIN first_visit f USING (visitor_id)
+)
 SELECT
-    visitor_id,
-    count()                 AS events_count,
-    round(avg(duration_ms)) AS avg_duration_ms
-FROM events
-GROUP BY visitor_id
-ORDER BY events_count DESC
-LIMIT 5;
+    cohort_date,
+    countIf(day_n = 0) AS d0,
+    countIf(day_n = 1) AS d1,
+    countIf(day_n = 3) AS d3,
+    round(countIf(day_n = 1) / countIf(day_n = 0), 3) AS retention_d1,
+    round(countIf(day_n = 3) / countIf(day_n = 0), 3) AS retention_d3
+FROM activity
+GROUP BY cohort_date
+ORDER BY cohort_date;
 ```
 
-**Результат:**
-| visitor_id | events_count | avg_duration_ms |
-|------------|--------------|-----------------|
-| 101        | 13           | 1058            |
-| 105        | 6            | 1867            |
-| 104        | 5            | 1800            |
-| 108        | 5            | 1450            |
-| 107        | 4            | 3600            |
+| cohort_date | d0 | d1 | d3 | retention_d1 | retention_d3 |
+|---|---|---|---|---|---|
+| 2026-09-04 | 5 | 3 | 3 | 0.600 | 0.600 |
+| 2026-09-05 | 2 | 2 | 2 | 1.000 | 1.000 |
+| 2026-09-06 | 2 | 1 | 1 | 0.500 | 0.500 |
+| 2026-09-07 | 1 | 0 | 0 | 0.000 | 0.000 |
 
+> Когорта 05.09 удерживается на 100%, 04.09 — 60% на D1.
 
-> **Бизнес-смысл:** самые активные пользователи — ядро аудитории. Их поведение — образец для анализа.
-
-### 6. Retention
-
-```sql
-SELECT
-    visitor_id,
-    uniq(toDate(event_time)) AS active_days
-FROM events
-GROUP BY visitor_id
-HAVING active_days > 1
-ORDER BY active_days DESC;
-```
-
-**Результат:**
-| visitor_id | active_days |
-|------------|-------------|
-| 107        | 4           |
-| 101        | 4           |
-| 108        | 3           |
-| 105        | 2           |
-| 109        | 2           |
-| 102        | 2           |
-
-> **Бизнес-смысл:** retention показывает, сколько дней пользователь возвращался. Высокий retention = продукт удерживает аудиторию.
-
-### 7. Средняя длительность по страницам
-
-```sql
-SELECT
-    url,
-    round(avg(duration_ms)) AS avg_duration_ms,
-    count()                 AS views
-FROM events
-WHERE event_type = 'pageview'
-GROUP BY url
-HAVING views >= 2
-ORDER BY avg_duration_ms DESC;
-```
-
-**Результат:**
-| url             | avg_duration_ms | views |
-|-----------------|-----------------|-------|
-| /docs           | 5167            | 3     |
-| /category/books | 4450            | 4     |
-| /home           | 1393            | 14    |
-
-> **Бизнес-смысл:** страницы с высокой длительностью — самые вовлекающие. `/docs` и категории — точки глубокого интереса. Главная — транзитная страница.
-
-### 8. Пользователи, дошедшие до покупки
-
-```sql
-SELECT
-    visitor_id,
-    countIf(event_type = 'product_view') AS product_views,
-    countIf(event_type = 'add_to_cart')  AS add_to_cart,
-    countIf(event_type = 'checkout')     AS checkouts,
-    countIf(event_type = 'purchase')     AS purchases
-FROM events
-GROUP BY visitor_id
-HAVING purchases > 0
-ORDER BY purchases DESC;
-```
-
-**Результат:**
-| visitor_id | product_views | add_to_cart | checkouts | purchases |
-|------------|---------------|-------------|-----------|-----------|
-| 101        | 3             | 2           | 2         | 2         |
-| 104        | 1             | 1           | 1         | 1         |
-| 105        | 1             | 1           | 1         | 1         |
-
-> **Бизнес-смысл:** пользователи, дошедшие до покупки — самые ценные для маркетплейса. Их путь по воронке можно использовать как эталон при поиске точек роста конверсии.
-
-### 9. Просмотры товаров с названием и категорией (JOIN)
-
-```sql
-SELECT
-    e.visitor_id,
-    p.product_name,
-    p.category,
-    p.price,
-    e.event_time
-FROM events e
-JOIN products p ON e.product_id = p.product_id
-WHERE e.event_type = 'product_view'
-ORDER BY e.event_time
-LIMIT 10;
-```
-
-**Результат:**
-| visitor_id | product_name    | category       | price | event_time          |
-|------------|-----------------|----------------|-------|---------------------|
-| 101        | Смартфон X      | Электроника    | 45000 | 2026-09-04 10:01:00 |
-| 103        | Книга "SQL"     | Книги          | 1200  | 2026-09-04 10:08:00 |
-| 101        | Смартфон X      | Электроника    | 45000 | 2026-09-05 11:01:00 |
-| 104        | Кофемашина Z    | Дом            | 35000 | 2026-09-05 11:03:00 |
-| 108        | Наушники Y      | Электроника    | 8000  | 2026-09-05 11:10:00 |
-| 102        | Книга "SQL"     | Книги          | 1200  | 2026-09-06 12:02:00 |
-| 105        | Беговая дорожка | Спорт          | 60000 | 2026-09-06 12:04:00 |
-| 109        | Беговая дорожка | Спорт          | 60000 | 2026-09-06 12:10:00 |
-| 101        | Смартфон X      | Электроника    | 45000 | 2026-09-07 13:01:00 |
-| 106        | Конструктор     | Детские товары | 2500  | 2026-09-07 13:06:00 |
-
-> **Бизнес-смысл:** JOIN со справочником товаров обогащает события названием, категорией и ценой. Это база для анализа «какие товары смотрят чаще всего» и «товары каких категорий интересны пользователям».
-
-### 10. Топ категорий по просмотрам товаров (JOIN + GROUP BY)
+### 6. Топ категорий по просмотрам (JOIN)
 
 ```sql
 SELECT
     p.category,
-    count()                 AS product_views,
-    uniq(e.visitor_id)      AS unique_visitors,
-    round(avg(p.price))     AS avg_price
+    count()             AS product_views,
+    uniq(e.visitor_id)  AS unique_visitors
 FROM events e
-JOIN products p ON e.product_id = p.product_id
+INNER JOIN products p
+    ON e.product_id = p.product_id
 WHERE e.event_type = 'product_view'
 GROUP BY p.category
 ORDER BY product_views DESC;
 ```
 
-**Результат:**
-| category       | product_views | unique_visitors | avg_price |
-|----------------|---------------|-----------------|-----------|
-| Электроника    | 4             | 2               | 35750     |
-| Книги          | 2             | 2               | 1200      |
-| Спорт          | 2             | 2               | 60000     |
-| Дом            | 1             | 1               | 35000     |
-| Детские товары | 1             | 1               | 2500      |
+| category | product_views | unique_visitors |
+|---|---|---|
+| Электроника | 4 | 2 |
+| Книги | 2 | 2 |
+| Спорт | 2 | 2 |
+| Дом | 1 | 1 |
+| Детские товары | 1 | 1 |
 
-> **Бизнес-смысл:** топ категорий по просмотрам — основа для категорийного менеджмента маркетплейса. Показывает, какие категории вызывают интерес, и какие товары смотрят, но не покупают.
+> Топ категорий — основа категорийного менеджмента.
 
-### 11. Воронка по категориям (JOIN + условные агрегации)
-
-```sql
-SELECT
-    p.category,
-    countIf(e.event_type = 'product_view') AS product_views,
-    countIf(e.event_type = 'add_to_cart')  AS add_to_cart,
-    countIf(e.event_type = 'purchase')     AS purchases
-FROM events e
-JOIN products p ON e.product_id = p.product_id
-GROUP BY p.category
-ORDER BY product_views DESC;
-```
-
-**Результат:**
-| category       | product_views | add_to_cart | purchases |
-|----------------|---------------|-------------|-----------|
-| Электроника    | 4             | 3           | 0         |
-| Книги          | 2             | 0           | 0         |
-| Спорт          | 2             | 2           | 0         |
-| Дом            | 1             | 1           | 0         |
-| Детские товары | 1             | 0           | 0         |
-
-> **Бизнес-смысл:** воронка в разрезе категорий показывает, где теряются пользователи на уровне товарной группы. Где-то высокая конверсия в корзину, где-то — низкая. Это точки для продуктовых и маркетинговых решений.
-
-## 📁 Структура проекта
+## 📁 Структура
 
 ```
-clickhouse-marketplace-web-analytics/
+clickhouse-web-analytics/
 ├── README.md
-├── schema.sql        # CREATE TABLE events + products
-├── insert_data.sql   # INSERT в обе таблицы
-└── queries.sql       # аналитические запросы
+├── 01_schema.sql
+├── 02_insert_data.sql
+├── 03_traffic_metrics.sql
+├── 04_funnel.sql
+└── 05_retention.sql
 ```
 
-## 📌 Что демонстрирует проект
+## 📌 Что демонстрирует
 
-- Понимание разницы между OLTP и OLAP (PostgreSQL vs ClickHouse).
-- Навык проектирования **нескольких таблиц** под аналитические нагрузки.
-- Умение писать аналитические запросы на диалекте ClickHouse.
-- Знание оптимизаций: партиционирование, `LowCardinality`, `ORDER BY` как индекс.
-- Работа с продуктовыми метриками маркетплейса: DAU, воронка покупки, retention, топ страниц, топ категорий.
-- Использование ClickHouse-специфичных функций: `uniq`, `countIf`, `toYYYYMM`.
-
-## 🔗 Интерактивная демонстрация
-
-[Открыть в SQLize.online — ClickHouse](https://sqlize.online/sql/clickhouse/3d57839f18ae033f995563311e9c764d/)
+- OLAP-проектирование: MergeTree, партиционирование, LowCardinality, материализованные колонки.
+- Корректная воронка (пошаговая, с CR) на уровне сессий и юзеров.
+- Когортный retention (D1/D3).
+- DAU/WAU/MAU + stickiness.
+- Window functions: `first_value`, `lagInFrame`, `dateDiff`.
+- ClickHouse-функции: `uniq`, `countIf`, `toYYYYMM`, `multiIf`.
